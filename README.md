@@ -88,7 +88,7 @@
   并重启那条连接 —— 之后该浏览器**静默连上，不再弹 Allow**。
 - token 从哪来：在该浏览器的扩展页 `chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/manage.html`
   打开控制台读 `localStorage["auth-token"]`（43 个字符）。
-- 也可以在会话里直接敲 `/browser token`：把已保存的 token 立刻重新应用到三条连接并报告结果。
+- 不需要任何命令：保存后宿主自己会在两秒内下发；想立刻重来一次，把 Token 再存一遍即可。
 
 ## 目录结构
 
@@ -96,7 +96,7 @@
 pwbrowser-bundle/
 ├── package.json          # dsh.bundle.patch 指向 cordis.patch.yml，dsh.client 指向 client.js
 ├── cordis.patch.yml      # 三个 dsh-mcp-client 配置项 + 本插件自身的宿主行
-├── index.js              # 宿主半边：/browser 命令 + browserMode 投影 + 提示词段落 + Token 配置与下发
+├── index.js              # 宿主半边：browserMode 投影 + 提示词段落 + 开关路由 + Token 配置与下发
 ├── client.js             # 界面半边：输入框工具行的「浏览器」开关 + 插件页的 Token 表单
 ├── locale/{en,zh}.json   # 插件在 Plugins 页面的标题/描述
 ├── docs/DETAIL.md        # 给用户看的完整说明（含排错）
@@ -106,14 +106,15 @@ pwbrowser-bundle/
 
 ## 「浏览器」开关（v1.1 新增）
 
-输入框左下角工具栏会多出一个地球图标的 **浏览器** 开关，和「计划」「目标」同一排：
+输入框左下角工具栏会多出一个**圆点 + 浏览器**的小开关，和隔壁「AI 控制电脑」长得一样：
 
-- **点亮** = 本会话进入浏览器模式：模型拿到一段 `browser:policy` 提示词，
+- **圆点变绿** = 本会话进入浏览器模式：模型拿到一段 `browser:policy` 提示词，
   优先用 `mcp__pwbrowser__google__*` / `__edge__*` / `__brave__*` 打开并操作真实网页；
-- **熄灭** = 回到普通的 `web_search` / `web_fetch`。
+- **圆点变灰** = 回到普通的 `web_search` / `web_fetch`（工具仍在，只是不再被点名优先）。
 
-开关状态是**每会话**的、写进会话日志的，所以重启 DSH、resume、fork 之后都还在。
-键盘党也可以直接敲 `/browser on`、`/browser off`、或不带参数的 `/browser`（切换）。
+点一下就切换，**不会往会话里写任何记录**（它不是斜杠命令，所以「+」和「/」菜单里也看不到
+`browser`）。开关状态是**每会话**的、写进会话日志的，所以重启 DSH、resume、fork 之后都还在。
+如果在模型回答途中点，界面会立刻变色，提示词从下一步生效（悬停提示"本轮结束后生效"）。
 
 ## 需要改什么
 
