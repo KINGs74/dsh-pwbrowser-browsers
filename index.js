@@ -7,14 +7,18 @@
  * model actually drive those tools for web work instead of reaching for
  * `web_fetch`/`web_search`. It mirrors the official plan-mode plugin:
  *
- * 1. `command/run` + `command/done` of `/browser` fold into the `browserMode`
- *    Session projection, so the state is logged, survives resume/fork, and is
- *    published to the client as a wire value the composer chip renders.
+ * 1. A log-only `browser/mode` event folds into the `browserMode` Session
+ *    projection, so the state survives resume/fork and drives the prompt.
  * 2. While the projection says active, a `browser:policy` prompt section is
  *    included in every model request for that Session.
+ * 3. The composer switch flips it over one exact HTTP route
+ *    (`/pwbrowser-browsers/mode`) instead of a slash command, so a click never
+ *    writes a command card into the conversation. Commands cannot be hidden
+ *    from the `/` and `+` menus, so this plugin registers none at all.
  *
- * No custom Session event is invented, and no state lives in the plugin: the
- * command log itself is the source of truth.
+ * No state lives in the plugin: the Session log is the source of truth. Older
+ * sessions that still hold `/browser` command events keep folding through the
+ * legacy branch below, so their mode is not lost.
  *
  * @module @local/pwbrowser-browsers
  */
@@ -23,8 +27,14 @@ import { writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-/** Command name that switches the mode (typed as `/browser on|off`). */
-const COMMAND = 'browser'
+/** Legacy slash command, still folded so old sessions keep their mode. */
+const LEGACY_COMMAND = 'browser'
+
+/** Log-only Session event the switch appends; the projection folds it. */
+const MODE_EVENT = 'browser/mode'
+
+/** Exact HTTP route the composer switch talks to. */
+const MODE_ROUTE = '/pwbrowser-browsers/mode'
 
 /** Prompt section name and its placement (right after PLAN_POLICY = 500). */
 const SECTION = 'browser:policy'
@@ -106,14 +116,20 @@ function wantedFrom(raw, current) {
   return undefined
 }
 
-/** Session projection folding the logged `/browser` executions. */
+/** Session projection folding the logged `browser/mode` events. */
 const projectionDefinition = {
   key: PROJECTION,
   stateVersion: 1,
   stateSchema,
   init: () => ({ active: false, running: null }),
   apply(state, event) {
-    if (event.type === 'command/run' && event.data !== undefined && event.data.name === COMMAND) {
+    if (event.type === MODE_EVENT) {
+      const active = event.data !== undefined && event.data.active === true
+      if (active === state.active && state.running === null) return state
+      return { active, running: null }
+    }
+    // Legacy: sessions written by 1.2.x hold `/browser on|off` command events.
+    if (event.type === 'command/run' && event.data !== undefined && event.data.name === LEGACY_COMMAND) {
       const wanted = wantedFrom(typeof event.data.args === 'string' ? event.data.args : '', state.active)
       if (wanted === undefined) return state
       return { ...state, running: { commandId: String(event.data.commandId), wanted } }
@@ -446,10 +462,10 @@ let lastTrace
 export const inject = ['systemPrompt', 'sessionProjections']
 
 /**
- * Register the projection, the prompt section, and the `/browser` command.
+ * Register the projection, the prompt section, and the composer switch's route.
  *
  * A failure here must not take the boot down with it: the MCP connections are
- * independent entries, so the browsers keep working and only the chip is
+ * independent entries, so the browsers keep working and only the switch is
  * missing.
  *
  * @param ctx - host root context.
@@ -470,52 +486,230 @@ export async function apply(ctx, config) {
     text: (context) => {
       const agent = context?.agent
       if (agent === undefined) return ''
-      try {
-        return handle.stateOf(agent.session).active ? SECTION_TEXT : ''
-      } catch (error) {
-        warn(ctx, 'reading browser mode failed; the section is omitted this step', error)
-        return ''
-      }
+      return readActive(agent.session) ? SECTION_TEXT : ''
     },
   }), 'pwbrowser-bundle: browser policy section')
 
-  // The command registry is composed independently; without it the mode is
-  // still readable (and a resumed session keeps its old state), it just cannot
-  // be switched from this build.
-  ctx.inject(['commands'], (commandCtx) => {
-    commandCtx.commands.register({
-      definitionId: '@local/pwbrowser-browsers',
-      name: COMMAND,
-      description: 'Turn the browser tools on or off for this session, or apply stored extension tokens',
-      input: { hint: '[on|off|token]' },
-      handler: async ({ agent, rawInput }) => {
-        const first = rawInput.trim().toLowerCase().split(/\s+/)[0]
-        if (first === 'token') {
-          const editor = ctx.get('configEditor')
-          const row = editor === undefined ? undefined : ownRow(editor.entries())
-          if (row === undefined) {
-            return { kind: 'error', text: 'Browser tokens cannot be edited in this profile.' }
-          }
-          const stored = readTokens(row.options.config)
-          const report = await reconcileTokens(ctx, stored)
-          return { kind: 'success', text: report.join('\n') }
-        }
-        const current = handle.stateOf(agent.session).active
-        const wanted = wantedFrom(rawInput, current)
-        if (wanted === undefined) {
-          return { kind: 'error', text: 'Use /browser on, /browser off, or /browser token.' }
-        }
-        if (wanted === current) {
-          return { kind: 'success', text: `Browser mode is already ${current ? 'on' : 'off'}.` }
-        }
-        return {
-          kind: 'success',
-          text: wanted
-            ? 'Browser mode on. Pages will be opened and driven with the browser tools.'
-            : 'Browser mode off. Web work falls back to the usual fetch and search tools.',
-        }
-      },
+  // ---------------------------------------------------------------------
+  // Session state. The switch is not a command (a registered command always
+  // shows up in the `/` and `+` menus and writes a card into the timeline), so
+  // the composer talks to the exact route below instead and the mode rides a
+  // log-only event, exactly like plan mode rides `plan/mode`.
+  // ---------------------------------------------------------------------
+
+  /** Selections made while a turn was open, awaiting the next pre-step. */
+  const pending = new WeakMap()
+
+  /** The logged mode of one session; unreadable state reads as off. */
+  const loggedActive = (session) => {
+    try {
+      return handle.stateOf(session).active === true
+    } catch (error) {
+      warn(ctx, 'reading browser mode failed; treating it as off', error)
+      return false
+    }
+  }
+
+  /** The mode a switch press should see: queued selection first, else logged. */
+  const readActive = (session) => {
+    const queued = pending.get(session)
+    return queued === undefined ? loggedActive(session) : queued
+  }
+
+  /** Whether the session currently sits inside an open turn. */
+  const hasOpenTurn = (session) => {
+    try {
+      const agents = ctx.get('agents')
+      if (agents === undefined) return false
+      return agents.turnBoundaryOf(session).openTurnStartSeq !== null
+    } catch (error) {
+      warn(ctx, 'reading the turn boundary failed; appending immediately', error)
+      return false
+    }
+  }
+
+  /**
+   * Select the mode for one session.
+   *
+   * Between turns the event is appended at once. Inside an open turn the
+   * selection is queued and lands at the next accepted in-turn pre-step, where
+   * `Session.append` is safe (mid-turn publication would re-enter the turn).
+   *
+   * @param session - the target session.
+   * @param active - the wanted state.
+   * @returns `noop`, `queued`, or `committed`.
+   */
+  const setActive = (session, active) => {
+    if (active === readActive(session)) {
+      if (pending.get(session) === active) pending.delete(session)
+      return 'noop'
+    }
+    if (hasOpenTurn(session)) {
+      pending.set(session, active)
+      return 'queued'
+    }
+    session.append(MODE_EVENT, { active })
+    pending.delete(session)
+    return 'committed'
+  }
+
+  // Pre-step is outside `Session.append` publication, so a queued selection can
+  // be appended there without re-entering the session. A failed append stays
+  // queued for a later step, and never blocks the step itself.
+  ctx.effect(() => ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    const queued = pending.get(agent.session)
+    if (queued === undefined || decision?.kind === 'reject' || signal?.aborted) return decision
+    try {
+      agent.session.append(MODE_EVENT, { active: queued })
+      pending.delete(agent.session)
+    } catch (error) {
+      warn(ctx, 'appending the queued browser mode failed; it stays queued', error)
+    }
+    return decision
+  }), 'pwbrowser-bundle: queued browser mode flush')
+
+  const sessions = () => {
+    try {
+      return ctx.get('sessions')
+    } catch (error) {
+      return undefined
+    }
+  }
+
+  /** The `sessionId` query parameter, clipped like the desktop-control route. */
+  const sessionOfRequest = (request) => {
+    try {
+      const url = new URL(String(request?.url ?? ''), 'http://127.0.0.1')
+      const id = url.searchParams.get('sessionId')
+      return id === null ? '' : id.slice(0, 128)
+    } catch (error) {
+      return ''
+    }
+  }
+
+  /**
+   * Whether a request comes from an authenticated DSH window.
+   *
+   * The switch is the user's standing permission to act on pages, so a shell
+   * capable model must not be able to grant it to itself. Without a
+   * `connection` service (headless compositions) the check is skipped.
+   *
+   * @param request - the incoming request.
+   * @returns true when the caller may change the mode.
+   */
+  const fromBrowser = (request) => {
+    let connection
+    try {
+      connection = ctx.get('connection')
+    } catch (error) {
+      return true
+    }
+    const auth = connection?.browserAuth
+    if (auth === undefined || typeof auth.isAuthenticated !== 'function') return true
+    let secure = false
+    try {
+      secure = ctx.get('webServer')?.protocol === 'https:'
+    } catch (error) {
+      secure = false
+    }
+    return auth.isAuthenticated(request, secure) === true
+  }
+
+  /** Write one JSON response. */
+  const respond = (response, status, body) => {
+    const text = JSON.stringify(body)
+    response.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-length': Buffer.byteLength(text),
     })
+    response.end(text)
+  }
+
+  /** Read a small JSON body; `undefined` means "not valid JSON". */
+  const readJson = (request) => new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    request.on('data', (chunk) => {
+      size += chunk.length
+      if (size > 8192) {
+        done(undefined)
+        request.destroy?.()
+        return
+      }
+      chunks.push(chunk)
+    })
+    request.on('error', () => done(undefined))
+    request.on('end', () => {
+      try {
+        done(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        done(undefined)
+      }
+    })
+  })
+
+  /** The exact route the composer switch reads and writes. */
+  const route = async (request, response) => {
+    try {
+      const id = sessionOfRequest(request)
+      const store = sessions()
+      const session = id === '' || store === undefined ? undefined : store.get(id)
+      if (session === undefined || session === null) {
+        respond(response, 400, { error: 'unknown session' })
+        return
+      }
+      if (request.method === 'GET' || request.method === 'HEAD') {
+        respond(response, 200, { active: readActive(session) })
+        return
+      }
+      if (request.method !== 'POST') {
+        response.setHeader('allow', 'GET, HEAD, POST')
+        respond(response, 405, { error: 'use GET or POST' })
+        return
+      }
+      if (!fromBrowser(request)) {
+        respond(response, 401, {
+          error: 'this change has to come from the DSH window',
+          hint: 'a model with shell access cannot turn browser mode on for itself',
+        })
+        return
+      }
+      const body = await readJson(request)
+      if (body === undefined || typeof body.active !== 'boolean') {
+        respond(response, 400, { error: 'expected {"active": true|false}' })
+        return
+      }
+      const outcome = setActive(session, body.active)
+      respond(response, 200, { active: readActive(session), queued: outcome === 'queued' })
+    } catch (error) {
+      warn(ctx, 'the browser mode route failed', error)
+      try {
+        respond(response, 500, { error: 'the mode could not be changed' })
+      } catch (ignored) {
+        /* The response may already be gone. */
+      }
+    }
+  }
+
+  // The Web carrier is composed independently: without it the switch is simply
+  // absent, while the prompt section and the folded state keep working.
+  ctx.inject(['webServer'], (webCtx) => {
+    ctx.effect(() => {
+      try {
+        return webCtx.webServer.register({ kind: 'exact', path: MODE_ROUTE, handler: route })
+      } catch (error) {
+        warn(ctx, 'the browser mode route could not be registered; the switch stays hidden', error)
+        return () => {}
+      }
+    }, 'pwbrowser-bundle: browser mode route')
   })
 
   // Tokens saved on the plugin page land in this row's configuration; this
