@@ -1,13 +1,16 @@
 /**
  * pwbrowser-bundle browser half: the composer's "browser mode" switch.
  *
- * A chip on the left of the composer tool row, next to the other toolbar
- * controls: ticked means "use the browser for this Session". It renders the
- * host-projected `browserMode` value and flips it by executing
- * `/browser on` / `/browser off` through the official remote command endpoint —
- * the same path the shipped plan chip uses. There is no hidden client state:
- * the host logs the switch, folds it into the projection, and the chip renders
- * what came back.
+ * A switch on the left of the composer tool row, next to the other toolbar
+ * controls: green means "use the browser for this Session". It reads and writes
+ * the host route `/pwbrowser-browsers/mode`, which appends a log-only
+ * `browser/mode` event — so a press never writes a command card into the
+ * conversation, and this plugin registers no slash command at all (a registered
+ * command cannot be hidden from the `/` and `+` menus).
+ *
+ * The projection's value paints the first frame; the route's answer is the
+ * source of truth from then on, re-read on a slow poll and on window focus so a
+ * reload, another window, or the model's own turn keeps the dot honest.
  *
  * Loaded by the web client through the package's `dsh.client` declaration
  * (`platform: "web"`, mounted at boot) and kept alive by the host row this
@@ -36,10 +39,11 @@ window.__ModuleLoader__.load({
     const DICT = {
       zh: {
         'chip.label': '浏览器',
-        'chip.on.title': '浏览器模式已开启：模型会用浏览器打开并操作真实网页，点击关闭',
-        'chip.off.title': '开启浏览器模式：模型会用浏览器打开并操作真实网页',
+        'chip.on.title': '浏览器已开启：模型会用浏览器打开并操作真实网页，点一下关闭',
+        'chip.off.title': '浏览器已关闭：点一下让模型用浏览器打开并操作真实网页',
         'chip.busy': '正在切换浏览器模式…',
         'chip.failed': '切换浏览器模式失败',
+        'chip.queued': '本轮结束后生效',
         'token.title': '浏览器扩展 Token',
         'token.desc': '把每个浏览器扩展里的 auth-token 填在这里（只写不回显）。连接会静默建立，不再弹 Allow。输入框留空表示不修改该浏览器。',
         'token.where': '取值位置：浏览器打开 chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/manage.html，复制 localStorage["auth-token"] 的值（43 个字符）。',
@@ -64,9 +68,10 @@ window.__ModuleLoader__.load({
       en: {
         'chip.label': 'Browser',
         'chip.on.title': 'Browser mode is on — the model drives real pages; click to turn it off',
-        'chip.off.title': 'Turn browser mode on: the model drives real pages with the browser',
+        'chip.off.title': 'Browser mode is off — click to let the model drive real pages',
         'chip.busy': 'Switching browser mode…',
         'chip.failed': 'Could not switch browser mode',
+        'chip.queued': 'Applies after this turn',
         'token.title': 'Browser extension tokens',
         'token.desc': 'Paste each browser extension\'s auth-token here (write-only). Connections then attach silently instead of asking for "Allow". An empty box leaves that browser unchanged.',
         'token.where': 'Where to find it: open chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/manage.html and copy localStorage["auth-token"] (43 characters).',
@@ -92,14 +97,15 @@ window.__ModuleLoader__.load({
 
     const STYLE_ID = 'pwbrowser-browser-chip-style'
     const CSS = `
-.pwb-chip{display:inline-flex;align-items:center;gap:4px;height:28px;padding:0 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}
-@media (hover:hover){.pwb-chip:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}}
+.pwb-chip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:13px;font-weight:500;line-height:20px;cursor:pointer}
+@media (hover:hover){.pwb-chip:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,var(--dsw-alias-bg-layer-2));color:var(--dsw-alias-label-primary)}}
 .pwb-chip:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px}
-.pwb-chip--on{background:var(--dsw-alias-state-business-tertiary);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary))}
-@media (hover:hover){.pwb-chip--on:hover:not(:disabled){color:var(--dsw-alias-state-business-primary,var(--dsw-alias-brand-primary));background:var(--dsw-alias-state-business-tertiary)}}
-.pwb-chip:disabled{opacity:.6;cursor:default}
-.pwb-chip--failed:not(.pwb-chip--on){color:var(--dsw-alias-state-error-primary)}
-.pwb-chip__glyph{display:inline-flex;flex:0 0 auto;width:14px;height:14px;color:currentColor}
+.pwb-chip:active:not(:disabled){transform:translateY(.5px)}
+.pwb-chip:disabled{opacity:.65;cursor:progress}
+.pwb-chip__dot{flex:0 0 auto;width:6px;height:6px;border-radius:999px;background:var(--dsw-alias-state-idle-primary)}
+.pwb-chip[data-pwbrowser-mode='on'] .pwb-chip__dot{background:var(--dsw-alias-state-success-primary)}
+.pwb-chip--failed .pwb-chip__dot{background:var(--dsw-alias-state-error-primary)}
+@media (max-width:860px){.pwb-chip__label{display:none}}
 .pwb-chip__label{white-space:nowrap}
 .pwb-form{display:flex;flex-direction:column;gap:12px;padding:4px 0}
 .pwb-form__title{margin:0;font-size:13px;font-weight:600;line-height:20px;color:var(--dsw-alias-label-primary)}
@@ -122,26 +128,131 @@ window.__ModuleLoader__.load({
 `
 
     /**
-     * A globe: the page-facing tool group, drawn inline so the chip needs no
-     * icon package.
-     * @returns the glyph element.
+     * The switch's route, resolved against the page's own base so a deployment
+     * behind a path prefix keeps working. Must match `MODE_ROUTE` in the host
+     * half.
      */
-    function globeGlyph() {
-      return h('svg', {
-        className: 'pwb-chip__glyph',
-        viewBox: '0 0 16 16',
-        fill: 'none',
-        stroke: 'currentColor',
-        strokeWidth: '1.4',
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-        'aria-hidden': 'true',
-        focusable: 'false',
-      },
-        h('circle', { cx: '8', cy: '8', r: '6.1' }),
-        h('path', { d: 'M1.9 8h12.2' }),
-        h('path', { d: 'M8 1.9c1.7 1.8 2.6 3.9 2.6 6.1S9.7 12.3 8 14.1C6.3 12.3 5.4 10.2 5.4 8S6.3 3.7 8 1.9z' }),
-      )
+    const MODE_ROUTE = '/pwbrowser-browsers/mode'
+
+    /** Resolve the route against the current document. */
+    function modeUrl(sessionId) {
+      const base = typeof document === 'undefined' ? 'http://127.0.0.1/' : document.baseURI
+      const url = new URL(MODE_ROUTE, base)
+      if (typeof sessionId === 'string' && sessionId !== '') url.searchParams.set('sessionId', sessionId)
+      return url
+    }
+
+    /**
+     * The mode of this session, read from and written to the host route.
+     *
+     * The host is the only source of truth: a press is applied optimistically
+     * so the dot flips at once, then overwritten by the response (or rolled
+     * back on failure). A slow poll keeps the dot right when another window, a
+     * reload, or the model's own turn changed the state first.
+     *
+     * @param sessionId - the session the switch belongs to.
+     * @param projected - the projection's value, used for the first paint.
+     * @returns the state, plus `toggle` and `refresh`.
+     */
+    function useBrowserMode(sessionId, projected) {
+      const initial = {
+        phase: typeof sessionId === 'string' && sessionId !== '' ? 'loading' : 'unavailable',
+        active: projected === true,
+        busy: false,
+        queued: false,
+        error: null,
+      }
+      const pair = React.useState(initial)
+      const state = pair[0]
+      const setState = pair[1]
+      const aliveRef = React.useRef(true)
+      const busyRef = React.useRef(false)
+
+      React.useEffect(() => {
+        aliveRef.current = true
+        return () => {
+          aliveRef.current = false
+        }
+      }, [])
+
+      React.useEffect(() => {
+        if (initial.phase === 'unavailable') return undefined
+        let live = true
+
+        const read = async () => {
+          if (busyRef.current) return
+          try {
+            const response = await fetch(modeUrl(sessionId), {
+              cache: 'no-store',
+              headers: { accept: 'application/json' },
+              credentials: 'same-origin',
+            })
+            if (!response.ok) throw new Error('HTTP ' + String(response.status))
+            const body = await response.json()
+            if (!live || !aliveRef.current) return
+            setState((previous) => ({
+              phase: 'ready',
+              active: body.active === true,
+              busy: previous.busy,
+              queued: body.queued === true,
+              error: null,
+            }))
+          } catch (error) {
+            if (!live || !aliveRef.current) return
+            reportFailure('read browser mode', error)
+            setState((previous) => ({ ...previous, phase: 'error', error: String(error && error.message ? error.message : error) }))
+          }
+        }
+
+        void read()
+        const timer = setInterval(() => { void read() }, 4000)
+        const onFocus = () => { void read() }
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+          window.addEventListener('focus', onFocus)
+        }
+        return () => {
+          live = false
+          clearInterval(timer)
+          if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+            window.removeEventListener('focus', onFocus)
+          }
+        }
+      }, [sessionId])
+
+      const toggle = React.useCallback(async () => {
+        if (busyRef.current || initial.phase === 'unavailable') return null
+        const wanted = !state.active
+        busyRef.current = true
+        setState((previous) => ({ ...previous, active: wanted, busy: true, error: null }))
+        try {
+          const response = await fetch(modeUrl(sessionId), {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify({ active: wanted }),
+          })
+          const body = await response.json().catch(() => undefined)
+          if (!response.ok || body === undefined) {
+            throw new Error(body && body.error ? String(body.error) : 'HTTP ' + String(response.status))
+          }
+          if (aliveRef.current) {
+            setState({ phase: 'ready', active: body.active === true, busy: false, queued: body.queued === true, error: null })
+          }
+          return null
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error)
+          reportFailure('switch browser mode', error)
+          if (aliveRef.current) {
+            setState((previous) => ({ ...previous, active: !wanted, busy: false, queued: false, error: message }))
+          }
+          return message
+        } finally {
+          busyRef.current = false
+        }
+      }, [sessionId, state.active, initial.phase])
+
+      return { state, toggle }
     }
 
     /**
@@ -163,68 +274,48 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The switch itself.
+     * The switch itself: a dot plus its label, the same shape as the desktop
+     * control switch next to it. Green means the model drives real pages.
      *
-     * Props: the slot's runtime share (`useProjection`, `sessionId`, …), the
-     * injected face from `apply`, and the locale seat's `t`.
+     * Props: the slot's runtime share (`sessionId`, `useProjection`) and the
+     * locale seat's `t`.
      *
      * @param props - component props.
-     * @returns the chip element.
+     * @returns the switch element.
      */
     function BrowserChip(props) {
       const t = props.t
       const useProjection = props.useProjection
-      const setBrowserMode = props.setBrowserMode
-
-      const statePair = React.useState({ busy: false, failure: null })
-      const local = statePair[0]
-      const setLocal = statePair[1]
-      const aliveRef = React.useRef(true)
-
-      React.useEffect(() => {
-        aliveRef.current = true
-        return () => {
-          aliveRef.current = false
-        }
-      }, [])
-
-      // The host value is the only source of truth; a projection that has not
-      // arrived yet (or a slot without the runtime share) reads as "off".
       const projected = typeof useProjection === 'function' ? useProjection(PROJECTION) : undefined
-      const active = projected === true
+      const { state, toggle } = useBrowserMode(props.sessionId, projected)
+      const active = state.active === true
 
-      const toggle = React.useCallback(() => {
-        if (local.busy) return
-        setLocal({ busy: true, failure: null })
-        void setBrowserMode(!active).then((failure) => {
-          if (!aliveRef.current) return
-          setLocal({ busy: false, failure })
-        }, (reason) => {
-          if (!aliveRef.current) return
-          setLocal({ busy: false, failure: reason instanceof Error ? reason.message : String(reason) })
-        })
-      }, [active, local.busy, setBrowserMode])
-
-      const title = local.busy
+      const title = state.busy
         ? t('chip.busy')
-        : local.failure !== null
-          ? `${t('chip.failed')}: ${local.failure}`
-          : active ? t('chip.on.title') : t('chip.off.title')
+        : state.error !== null
+          ? t('chip.failed') + ': ' + state.error
+          : state.queued
+            ? t('chip.queued')
+            : active ? t('chip.on.title') : t('chip.off.title')
 
       return h('button', {
         type: 'button',
         className: [
           'pwb-chip',
-          active ? 'pwb-chip--on' : '',
-          local.failure !== null ? 'pwb-chip--failed' : '',
+          state.error !== null ? 'pwb-chip--failed' : '',
         ].filter(Boolean).join(' '),
         'aria-pressed': active,
         'aria-label': title,
         'data-pwbrowser-mode': active ? 'on' : 'off',
+        'data-busy': state.busy ? '1' : '0',
         title,
-        disabled: local.busy,
-        onClick: toggle,
-      }, globeGlyph(), h('span', { className: 'pwb-chip__label' }, t('chip.label')))
+        disabled: state.busy,
+        onClick: () => {
+          void toggle()
+        },
+      },
+        h('span', { className: 'pwb-chip__dot', 'aria-hidden': 'true' }),
+        h('span', { className: 'pwb-chip__label' }, t('chip.label')))
     }
 
     /** Package name this browser half belongs to; the plugin page keys on it. */
@@ -501,7 +592,7 @@ window.__ModuleLoader__.load({
      */
     function reportFailure(what, error) {
       try {
-        console.error(`[pwbrowser] ${what} registration failed:`, error)
+        console.error(`[pwbrowser] ${what} failed:`, error)
       } catch (ignored) {
         /* Ignore. */
       }
@@ -516,6 +607,9 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.locale.register(NS, DICT), 'pwbrowser-bundle: dictionaries')
       const t = ctx.locale.bind(NS)
 
+      // The switch talks to the host route directly, so a press never writes a
+      // command card into the conversation and no command has to be registered
+      // (a registered command cannot be hidden from the `/` and `+` menus).
       try {
         ctx.slots.inject(SLOT, () => ctx.slots.register({
           name: SLOT,
@@ -523,22 +617,6 @@ window.__ModuleLoader__.load({
           order: ORDER,
           locale: NS,
           label: () => t('chip.label'),
-          inject: (sessionId) => ({
-            /**
-             * Switch the mode through the host command that owns it: the chip
-             * only names the wanted state, the host logs and folds it.
-             *
-             * @param on - the wanted state.
-             * @returns null when the command was admitted; a failure line otherwise.
-             */
-            setBrowserMode: async (on) => {
-              const line = on ? '/browser on' : '/browser off'
-              const result = await ctx.remote.commands.execute(sessionId, line, [])
-              if (!result.ok) return `${result.error.message} (${result.error.code})`
-              if (result.value === undefined) return `unknown command: ${line}`
-              return null
-            },
-          }),
         }, BrowserChip))
       } catch (error) {
         // A failed registration costs this one control and nothing else.
@@ -576,7 +654,7 @@ window.__ModuleLoader__.load({
 
     installStyles(typeof document === 'undefined' ? undefined : document)
 
-    exports.inject = ['slots', 'locale', 'remote', 'remote.commands']
+    exports.inject = ['slots', 'locale']
     exports.apply = apply
     return module.exports
   },
