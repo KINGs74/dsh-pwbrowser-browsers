@@ -82,8 +82,8 @@ showing this dialog again, unless you rotate the token* 说的是**带 token 的
 - **粘贴时多带了 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 之类的前缀、或者带成对引号/空格都没关系**，
   插件会先把它剥成裸 token 再下发。
 
-会话里也可以敲 `/browser token`：把**已保存**的 token 立刻重新下发到三条连接并打印结果
-（适合"patch 里已经有值但想强制重连一次"的场景）。
+不需要命令：保存后宿主每 2 秒对比一次"存着的 token"与"连接里的 token"，不一致就写入并重启那条连接。
+想强制重来一次，把同一个值再保存一遍即可（值相同则不会重复重启）。
 
 取 token 的办法（在该浏览器里打开 manage.html，然后执行）：
 
@@ -166,21 +166,29 @@ C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
 开之前问一句"要不要问一下用户"反而更烦。所以这个 bundle 还带一个开关，
 把「这次要不要开浏览器」变成一次点击：
 
-| 位置 | 输入框左下角工具行，地球图标 + **浏览器**（和「计划」「目标」同一排） |
-| 点亮后 | 本会话每步请求都带 `browser:policy` 提示词段落，模型优先用 `mcp__pwbrowser__*` 工具 |
-| 熄灭后 | 回到普通 `web_search` / `web_fetch`，工具仍然可用，只是不再被点名优先 |
-| 键盘 | `/browser on`、`/browser off`、裸 `/browser` 切换 |
-| token | `/browser token`：把插件页里存好的 token 重新下发到三条连接 |
+| 位置 | 输入框左下角工具行，圆点 + **浏览器**（和「AI 控制电脑」长得一样） |
+| 圆点变绿 | 本会话每步请求都带 `browser:policy` 提示词段落，模型优先用 `mcp__pwbrowser__*` 工具 |
+| 圆点变灰 | 回到普通 `web_search` / `web_fetch`，工具仍然可用，只是不再被点名优先 |
+| 怎么切 | 点一下就是一次切换（开→关、关→开），**不写任何会话记录** |
+| 回答途中点 | 界面立刻变色，提示词从下一步生效（悬停显示"本轮结束后生效"） |
 
-实现上它和官方的「计划」模式同构：
+实现上它和官方的「计划」模式同构，但**不用命令**：
 
-- 宿主半边（`index.js`）注册 `/browser` 命令，命令的 `command/run`、`command/done`
-  事件被折叠成 `browserMode` 会话投影 —— 状态**只**存在会话日志里，
-  所以重启、resume、fork 之后开关状态不丢；
-- 界面半边（`client.js`）在 `conversation.input.left` 注册开关，
-  读宿主投影渲染亮/灭，点击时只发一条 `/browser on|off`，不自己记状态；
+- 宿主半边（`index.js`）把 `browser/mode` 这个 **log-only 会话事件**折叠成 `browserMode`
+  会话投影 —— 状态**只**存在会话日志里，所以重启、resume、fork 之后开关状态不丢。
+  开口 turn 里点的话，选择先挂在内存里，等 `agent/pre-step` 再追加进日志
+  （mid-turn 直接 append 会重入会话，官方 plan 模式也是这么处理的）。
+- 界面半边（`client.js`）在 `conversation.input.left` 注册开关，读写宿主的一个精确路由
+  `/pwbrowser-browsers/mode`（GET 读、POST 写），按下时先乐观变色、失败再回滚；
+  另外每 4 秒和窗口重新聚焦时各读一次，保证重开页面、另一个窗口改动后颜色不会骗人。
 - 提示词用 `ctx.systemPrompt.section()` 的 `browser:policy`（order 510，紧跟
   `plan:policy` 的 500），按会话状态逐次请求决定是否出现。
+
+**为什么「+」/「/」菜单里没有 `browser` 了**：DSH 的 `CommandDefinition` 只有
+`{definitionId,name,description,input,recordInput,handler}`，没有"隐藏"位 —— 只要注册一个命令，
+它就会出现在菜单里，而且每次执行都会在会话时间线留下一条命令记录。把开关改成路由之后，
+这个插件**一个命令都不注册**，菜单自然干净；旧的「1.2.x 会话里已有的 `/browser` 事件」仍会被
+投影识别，所以老会话的模式不会丢。
 
 这条开关是**每会话**的：不同会话可以一个开着浏览器、一个关着。
 
