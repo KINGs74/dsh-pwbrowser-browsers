@@ -172,17 +172,31 @@ C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
 | 怎么切 | 点一下就是一次切换（开→关、关→开），**不写任何会话记录** |
 | 回答途中点 | 界面立刻变色，提示词从下一步生效（悬停显示"本轮结束后生效"） |
 
-实现上它和官方的「计划」模式同构，但**不用命令**：
+实现上它和官方的「计划」模式同构，但**不用命令**，也**不写会话日志**：
 
-- 宿主半边（`index.js`）把 `browser/mode` 这个 **log-only 会话事件**折叠成 `browserMode`
-  会话投影 —— 状态**只**存在会话日志里，所以重启、resume、fork 之后开关状态不丢。
-  开口 turn 里点的话，选择先挂在内存里，等 `agent/pre-step` 再追加进日志
-  （mid-turn 直接 append 会重入会话，官方 plan 模式也是这么处理的）。
+- 宿主半边（`index.js`）把每个会话的模式存在插件自己的文件
+  `$DSH_HOME/storages/pwbrowser-bundle.modes.json`（形如 `{"<sessionId>": true}`），
+  重启、resume 之后开关状态不丢；点一下立即落盘，不用等 turn 结束。
+  为什么不用会话事件：DSH 的读取端只接受「未知类型但 envelope 带 `ignorable: true`」的存储事件，
+  而活着的 `Session.append()` 设不了这个标记，`appendPluginRecord()` 又只留给官方 experimental 包
+  （见下面的事故记录）。投影里仍然保留对 1.3.0 `browser/mode` 事件和 1.2.x `/browser` 命令的折叠：
+  存储里没有该会话的条目时（老会话、或日志里留着旧事件），就回退到投影读到的状态。
 - 界面半边（`client.js`）在 `conversation.input.left` 注册开关，读写宿主的一个精确路由
   `/pwbrowser-browsers/mode`（GET 读、POST 写），按下时先乐观变色、失败再回滚；
   另外每 4 秒和窗口重新聚焦时各读一次，保证重开页面、另一个窗口改动后颜色不会骗人。
 - 提示词用 `ctx.systemPrompt.section()` 的 `browser:policy`（order 510，紧跟
   `plan:policy` 的 500），按会话状态逐次请求决定是否出现。
+
+### 事故记录：v1.3.0 的 `browser/mode` 把会话写坏（2026-11-23）
+
+v1.3.0 用 `session.append('browser/mode', …)` 写所谓 log-only 事件。这个类型不在宿主的
+`KNOWN_SESSION_EVENT_TYPES` 里，也没有 `ignorable: true`，于是读取端整份日志拒绝解析：
+
+`failed to observe session "…": session contains event type "browser/mode" (seq 9244) unknown to this harness and not marked ignorable; refusing to interpret the log`
+
+修复两步：把日志里 3 条 `browser/mode` 事件补上 `"ignorable": true`（逐 zstd frame 解压→改→重压，
+seq 与其它 frame 字节都不动），会话即可重新打开；插件改成上面的独立存储，v1.3.1 起不再往会话日志写任何事件。
+补过标记的旧会话仍能由投影折出当时的状态。
 
 **为什么「+」/「/」菜单里没有 `browser` 了**：DSH 的 `CommandDefinition` 只有
 `{definitionId,name,description,input,recordInput,handler}`，没有"隐藏"位 —— 只要注册一个命令，

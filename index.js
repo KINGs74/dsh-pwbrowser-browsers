@@ -7,31 +7,41 @@
  * model actually drive those tools for web work instead of reaching for
  * `web_fetch`/`web_search`. It mirrors the official plan-mode plugin:
  *
- * 1. A log-only `browser/mode` event folds into the `browserMode` Session
- *    projection, so the state survives resume/fork and drives the prompt.
- * 2. While the projection says active, a `browser:policy` prompt section is
+ * 1. The mode is stored per session in a file this plugin owns
+ *    (`$DSH_HOME/storages/pwbrowser-bundle.modes.json`), so it survives resume
+ *    and drives the prompt. It is deliberately *not* a Session event: a reader
+ *    accepts an unknown stored event only when its envelope carries
+ *    `ignorable: true`, a live `Session.append()` cannot set that marker, and
+ *    `appendPluginRecord()` belongs to the host's experimental packages. 1.3.0
+ *    appended `browser/mode` anyway, which made every Session it touched refuse
+ *    to reopen; the projection below now only folds such legacy events.
+ * 2. While the stored mode is active, a `browser:policy` prompt section is
  *    included in every model request for that Session.
  * 3. The composer switch flips it over one exact HTTP route
  *    (`/pwbrowser-browsers/mode`) instead of a slash command, so a click never
  *    writes a command card into the conversation. Commands cannot be hidden
  *    from the `/` and `+` menus, so this plugin registers none at all.
  *
- * No state lives in the plugin: the Session log is the source of truth. Older
- * sessions that still hold `/browser` command events keep folding through the
- * legacy branch below, so their mode is not lost.
+ * The switch's state is per session and the id is the store's key. Older
+ * sessions that still hold `/browser` command events, or the 1.3.0
+ * `browser/mode` events, keep folding through the legacy branches below, so
+ * their mode is not lost.
  *
  * @module @local/pwbrowser-browsers
  */
 
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /** Legacy slash command, still folded so old sessions keep their mode. */
 const LEGACY_COMMAND = 'browser'
 
-/** Log-only Session event the switch appends; the projection folds it. */
+/** Legacy Session event 1.3.0 appended; only the projection folds it now. */
 const MODE_EVENT = 'browser/mode'
+
+/** This plugin's per-session mode store, next to the host's other storages. */
+const MODES_FILE = join(homedir(), '.dsh', 'storages', 'pwbrowser-bundle.modes.json')
 
 /** Exact HTTP route the composer switch talks to. */
 const MODE_ROUTE = '/pwbrowser-browsers/mode'
@@ -116,7 +126,57 @@ function wantedFrom(raw, current) {
   return undefined
 }
 
-/** Session projection folding the logged `browser/mode` events. */
+/** The store's key for one session; `''` means "do not persist a mode". */
+function sessionKey(session) {
+  const id = session === null || session === undefined ? undefined : session.id
+  return typeof id === 'string' && id !== '' ? id : ''
+}
+
+/** Read the whole store; a missing or malformed file reads as empty. */
+function readModeStore() {
+  try {
+    const parsed = JSON.parse(readFileSync(MODES_FILE, 'utf8'))
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const modes = {}
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'boolean') modes[key] = value
+    }
+    return modes
+  } catch {
+    return {}
+  }
+}
+
+/** The stored mode of one session, or `undefined` when it was never stored. */
+function modeFromStore(session) {
+  const key = sessionKey(session)
+  return key === '' ? undefined : readModeStore()[key]
+}
+
+/**
+ * Store one session's mode.
+ *
+ * @param session - the session whose mode changes.
+ * @param active - the wanted state.
+ * @param report - called with a message (and cause) when the write fails.
+ */
+function storeMode(session, active, report) {
+  const key = sessionKey(session)
+  if (key === '') {
+    report('the session id is unavailable; browser mode is not stored', undefined)
+    return
+  }
+  try {
+    const modes = readModeStore()
+    modes[key] = active
+    mkdirSync(join(MODES_FILE, '..'), { recursive: true })
+    writeFileSync(MODES_FILE, `${JSON.stringify(modes, undefined, 2)}\n`)
+  } catch (error) {
+    report('storing browser mode failed', error)
+  }
+}
+
+/** Session projection folding the legacy `browser/mode` events of 1.3.0. */
 const projectionDefinition = {
   key: PROJECTION,
   stateVersion: 1,
@@ -492,16 +552,24 @@ export async function apply(ctx, config) {
 
   // ---------------------------------------------------------------------
   // Session state. The switch is not a command (a registered command always
-  // shows up in the `/` and `+` menus and writes a card into the timeline), so
-  // the composer talks to the exact route below instead and the mode rides a
-  // log-only event, exactly like plan mode rides `plan/mode`.
+  // shows up in the `/` and `+` menus and writes a card into the timeline), and
+  // it is not a Session event either: a reader accepts an unknown stored event
+  // only when the envelope carries `ignorable: true`, which a live
+  // `Session.append()` cannot set, and `appendPluginRecord()` belongs to the
+  // host's experimental packages. So the mode lives in this plugin's own store,
+  // keyed by session id, and the projection above only folds legacy events.
   // ---------------------------------------------------------------------
 
-  /** Selections made while a turn was open, awaiting the next pre-step. */
-  const pending = new WeakMap()
-
-  /** The logged mode of one session; unreadable state reads as off. */
-  const loggedActive = (session) => {
+  /**
+   * The mode of one session: this plugin's store first, legacy log second.
+   *
+   * A store miss (a session that predates the store, or one whose events were
+   * written by 1.3.x) falls back to the folded projection, which still replays
+   * `browser/mode` and `/browser` command events.
+   */
+  const readActive = (session) => {
+    const stored = modeFromStore(session)
+    if (stored !== undefined) return stored
     try {
       return handle.stateOf(session).active === true
     } catch (error) {
@@ -510,64 +578,22 @@ export async function apply(ctx, config) {
     }
   }
 
-  /** The mode a switch press should see: queued selection first, else logged. */
-  const readActive = (session) => {
-    const queued = pending.get(session)
-    return queued === undefined ? loggedActive(session) : queued
-  }
-
-  /** Whether the session currently sits inside an open turn. */
-  const hasOpenTurn = (session) => {
-    try {
-      const agents = ctx.get('agents')
-      if (agents === undefined) return false
-      return agents.turnBoundaryOf(session).openTurnStartSeq !== null
-    } catch (error) {
-      warn(ctx, 'reading the turn boundary failed; appending immediately', error)
-      return false
-    }
-  }
-
   /**
    * Select the mode for one session.
    *
-   * Between turns the event is appended at once. Inside an open turn the
-   * selection is queued and lands at the next accepted in-turn pre-step, where
-   * `Session.append` is safe (mid-turn publication would re-enter the turn).
+   * The store is a plain file this plugin owns, so a press lands immediately
+   * even inside an open turn: nothing is appended to the Session, so there is no
+   * turn-boundary publication to re-enter and no queued flush to wait for.
    *
    * @param session - the target session.
    * @param active - the wanted state.
-   * @returns `noop`, `queued`, or `committed`.
+   * @returns `noop` or `committed`.
    */
   const setActive = (session, active) => {
-    if (active === readActive(session)) {
-      if (pending.get(session) === active) pending.delete(session)
-      return 'noop'
-    }
-    if (hasOpenTurn(session)) {
-      pending.set(session, active)
-      return 'queued'
-    }
-    session.append(MODE_EVENT, { active })
-    pending.delete(session)
+    if (active === readActive(session)) return 'noop'
+    storeMode(session, active, (message, error) => warn(ctx, message, error))
     return 'committed'
   }
-
-  // Pre-step is outside `Session.append` publication, so a queued selection can
-  // be appended there without re-entering the session. A failed append stays
-  // queued for a later step, and never blocks the step itself.
-  ctx.effect(() => ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
-    const decision = await next()
-    const queued = pending.get(agent.session)
-    if (queued === undefined || decision?.kind === 'reject' || signal?.aborted) return decision
-    try {
-      agent.session.append(MODE_EVENT, { active: queued })
-      pending.delete(agent.session)
-    } catch (error) {
-      warn(ctx, 'appending the queued browser mode failed; it stays queued', error)
-    }
-    return decision
-  }), 'pwbrowser-bundle: queued browser mode flush')
 
   const sessions = () => {
     try {

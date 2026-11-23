@@ -1,10 +1,34 @@
-> **本仓库 = 一个插件**：仓库根目录就是这个插件包本身（`package.json` + `cordis.patch.yml` + `index.js` + `client.js`）。
-> 打包好的 `.tgz` 在 [dsh-vendor](https://github.com/KINGs74/dsh-vendor) 的 Release 里；别的插件各有各的仓库（`dsh-xxx`）。
-
 # 浏览器控制 bundle（Chrome / Edge / Brave）
 
 一个可迁移的 DSH 插件：把三款 Chromium 浏览器作为独立的 MCP 服务接进 DSH，
 让模型直接操作你**已经登录**的窗口。
+
+## ⚠️ 已装过 1.3.0 的机器：先升级，再修日志
+
+1.3.0 的圆点开关会往会话日志写 `browser/mode` 事件，而 DSH 读取端不认这个类型，导致
+**点过开关的会话全部打不开**，报：
+
+```
+failed to observe session "session-…": session contains event type "browser/mode"
+(seq 9244) unknown to this harness and not marked ignorable
+```
+
+日志本身没坏（消息一条不少），补上 `ignorable: true` 标记即可恢复。**顺序很重要：先升级插件，
+再点圆点**，否则旧代码会再次写坏会话。
+
+```bash
+# 1) 升级到 1.3.1（插件页「添加插件」粘 tgz 直链，或源码目录覆盖）
+# 2) 先干跑，列出哪些会话被锁
+node "%USERPROFILE%\.dsh\profiles\desktop\node_modules\@local\pwbrowser-browsers\tools\repair-browser-mode-events.mjs"
+# 3) 确认后真正修（会自动备份到 ~/.dsh/sessions/_repair-backups/）
+node "%USERPROFILE%\.dsh\profiles\desktop\node_modules\@local\pwbrowser-browsers\tools\repair-browser-mode-events.mjs" --apply
+# 4) 重启 DSH，再打开那些会话
+```
+
+- 只重写含 `browser/mode` 的那几个 zstd frame（加标记后按原 checksum 设置重压），其它 frame 原字节不动，seq 连续。
+- 每次 `--apply` 前会把原文件备份成 `_repair-backups/<时间>-<会话id>.v4.jsonl.zstd.orig`。
+- 1.3.1 起开关状态存在 `~/.dsh/storages/pwbrowser-bundle.modes.json`，**不再写任何会话事件**。
+- 想看细节：`docs/DETAIL.md` 的「事故记录」一节。
 
 ## 在另一台电脑上安装
 
@@ -34,7 +58,7 @@
 2. **拿到包**（三种来源，挑一种）
 
    - **公开镜像直链**（最快，不用登录 GitHub）：
-     `https://github.com/KINGs74/dsh-vendor/releases/download/plugins-2026-11-20/local-pwbrowser-browsers-1.2.2.tgz`
+     `https://github.com/KINGs74/dsh-vendor/releases/download/plugins-2026-11-23/local-pwbrowser-browsers-1.3.1.tgz`
      —— 浏览器打开就下载，25 KB。
    - **自己打包**：在本仓库目录跑 `npm pack`，得到 `local-pwbrowser-browsers-<版本>.tgz`。
    - **源码目录**：把 `pwbrowser-bundle/` 整个拷过去（**要改代码就用这个**，装完改完重载即生效）。
@@ -45,14 +69,14 @@
 
    | 粘贴什么 | 例子 | 适用 |
    | --- | --- | --- |
-   | Release 直链 | `https://github.com/KINGs74/dsh-vendor/releases/download/plugins-2026-11-20/local-pwbrowser-browsers-1.2.2.tgz` | 那台机器能访问 github.com |
-   | 本地文件绝对路径 | `C:\Users\你\Downloads\local-pwbrowser-browsers-1.2.2.tgz` | 已经下到本机 / 网络不行 |
+   | Release 直链 | `https://github.com/KINGs74/dsh-vendor/releases/download/plugins-2026-11-23/local-pwbrowser-browsers-1.3.1.tgz` | 那台机器能访问 github.com |
+   | 本地文件绝对路径 | `C:\Users\你\Downloads\local-pwbrowser-browsers-1.3.1.tgz` | 已经下到本机 / 网络不行 |
    | 源码目录绝对路径 | `D:\dsh-bundles\pwbrowser-bundle` | 想改代码 |
 
    ⚠️ **两个最常见的错**：
 
    - 把 tgz 地址填进「**安装源**」——那是 npm registry，pnpm 会拼出 `…/xxx.tgz/包名` 这种地址，然后把 GitHub 的 404 HTML 页面当 JSON 解析，报 `ERR_PNPM_BROKEN_METADATA_JSON`。tgz 属于「包名或地址」框。
-   - 粘贴 Release **页面**地址（`…/releases/tag/plugins-2026-11-20`）而不是**文件直链**（`…/releases/download/plugins-2026-11-20/文件名.tgz`）。
+   - 粘贴 Release **页面**地址（`…/releases/tag/plugins-2026-11-23`）而不是**文件直链**（`…/releases/download/plugins-2026-11-23/文件名.tgz`）。
 
    「安装源」怎么选（这一步最容易出错，按表来）：
 
